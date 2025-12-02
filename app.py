@@ -67,11 +67,12 @@ CAPABILITIES: Dict[str, Any] = {
 }
 
 # ---------------- model / op registry ----------------
+# Agent-lite: CPU only, no GPU detection
 
 _model_lock = threading.Lock()
 _classifier_tokenizer: Optional[AutoTokenizer] = None
 _classifier_model: Optional[AutoModelForSequenceClassification] = None
-_classifier_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+_classifier_device = "cpu"  # Agent-lite: CPU only
 
 
 def _load_classifier_if_needed():
