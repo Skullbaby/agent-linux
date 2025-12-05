@@ -13,9 +13,6 @@ try:
 except ImportError:
     psutil = None
 
-import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-
 from worker_sizing import build_worker_profile
 
 # ---------------- config ----------------
@@ -27,12 +24,12 @@ TASK_WAIT_MS = int(os.getenv("TASK_WAIT_MS", "2000"))
 HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "6"))
 AGENT_LABELS_RAW = os.getenv("AGENT_LABELS", "")
 
-MODEL_NAME = os.getenv(
-    "CLASSIFY_MODEL",
-    "assemblyai/distilbert-base-uncased-sst2",
-)
-
 _running = True
+
+# Lite agent CPU behavior
+BUSY_CPU_THRESHOLD = float(os.getenv("LITE_BUSY_CPU_THRESHOLD", "30.0"))
+CPU_CHECK_INTERVAL = float(os.getenv("LITE_CPU_CHECK_INTERVAL", "2.0"))
+DISABLE_ON_BATTERY = os.getenv("LITE_DISABLE_ON_BATTERY", "1") not in ("0", "false", "False")
 
 # ---------------- Local metrics tracking ----------------
 
@@ -63,29 +60,11 @@ if AGENT_LABELS_RAW.strip():
 BASE_LABELS["worker_profile"] = WORKER_PROFILE
 
 CAPABILITIES: Dict[str, Any] = {
-    "ops": ["map_tokenize", "map_classify"]
+    # Lite agent: cheap text ops only
+    "ops": ["map_tokenize", "map_classify"],
 }
 
-# ---------------- model / op registry ----------------
-# Agent-lite: CPU only, no GPU detection
-
-_model_lock = threading.Lock()
-_classifier_tokenizer: Optional[AutoTokenizer] = None
-_classifier_model: Optional[AutoModelForSequenceClassification] = None
-_classifier_device = "cpu"  # Agent-lite: CPU only
-
-
-def _load_classifier_if_needed():
-    global _classifier_tokenizer, _classifier_model
-    with _model_lock:
-        if _classifier_tokenizer is not None and _classifier_model is not None:
-            return
-
-        print(f"[agent] loading classifier model: {MODEL_NAME} on {_classifier_device}")
-        _classifier_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-        _classifier_model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
-        _classifier_model.to(_classifier_device)
-        _classifier_model.eval()
+# ---------------- ops: tokenize + lightweight classify ----------------
 
 
 def op_map_tokenize(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -107,21 +86,47 @@ def op_map_tokenize(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+_POSITIVE_WORDS = {
+    "good",
+    "great",
+    "excellent",
+    "awesome",
+    "love",
+    "like",
+    "amazing",
+    "fantastic",
+    "happy",
+    "pleased",
+    "cool",
+}
+
+_NEGATIVE_WORDS = {
+    "bad",
+    "terrible",
+    "awful",
+    "hate",
+    "dislike",
+    "horrible",
+    "sad",
+    "angry",
+    "upset",
+    "annoying",
+    "disappointed",
+}
+
+
 def op_map_classify(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Sentiment classification using HF model.
+    Lightweight rules-based sentiment classifier for agent-lite.
 
     Payload:
       { "text": "some text" }
 
-    Result includes:
-      - label
-      - score
-      - raw logits (optional)
+    Result:
+      { "ok": true, "label": "POSITIVE"/"NEGATIVE"/"NEUTRAL", "score": float }
     """
-    text = str(payload.get("text", ""))
-
-    if not text.strip():
+    text = str(payload.get("text", "")).strip()
+    if not text:
         return {
             "ok": True,
             "label": "NEUTRAL",
@@ -129,29 +134,31 @@ def op_map_classify(payload: Dict[str, Any]) -> Dict[str, Any]:
             "detail": "empty text",
         }
 
-    _load_classifier_if_needed()
-    assert _classifier_tokenizer is not None
-    assert _classifier_model is not None
+    tokens = [t.strip(".,!?;:").lower() for t in text.split() if t.strip()]
 
-    inputs = _classifier_tokenizer(
-        text,
-        return_tensors="pt",
-        truncation=True,
-        max_length=256,
-    ).to(_classifier_device)
+    pos_hits = sum(1 for t in tokens if t in _POSITIVE_WORDS)
+    neg_hits = sum(1 for t in tokens if t in _NEGATIVE_WORDS)
 
-    with torch.no_grad():
-        outputs = _classifier_model(**inputs)
-        logits = outputs.logits[0]
-        probs = torch.softmax(logits, dim=-1)
-        score, idx = torch.max(probs, dim=-1)
-        label = _classifier_model.config.id2label[int(idx)]
+    if pos_hits == 0 and neg_hits == 0:
+        label = "NEUTRAL"
+        score = 0.0
+    elif pos_hits > neg_hits:
+        label = "POSITIVE"
+        score = float(pos_hits) / float(pos_hits + neg_hits)
+    elif neg_hits > pos_hits:
+        label = "NEGATIVE"
+        score = float(neg_hits) / float(pos_hits + neg_hits)
+    else:
+        # tie
+        label = "NEUTRAL"
+        score = 0.0
 
     return {
         "ok": True,
         "label": label,
-        "score": float(score),
-        "logits": [float(x) for x in logits.tolist()],
+        "score": score,
+        "pos_hits": pos_hits,
+        "neg_hits": neg_hits,
     }
 
 
@@ -202,6 +209,14 @@ def _collect_metrics() -> Dict[str, Any]:
         except Exception:
             pass
 
+        try:
+            battery = psutil.sensors_battery()
+            if battery is not None:
+                metrics["on_battery"] = not battery.power_plugged
+                metrics["battery_percent"] = battery.percent
+        except Exception:
+            pass
+
     # Task performance metrics
     with _metrics_lock:
         metrics["tasks_completed"] = _tasks_completed
@@ -212,6 +227,41 @@ def _collect_metrics() -> Dict[str, Any]:
             metrics["avg_task_ms"] = avg_ms
 
     return metrics
+
+
+# ---------------- system load guard ----------------
+
+
+def system_allows_work() -> bool:
+    """
+    Decide whether the agent should lease/execute work, based on
+    system CPU load and battery status.
+    """
+    if psutil is None:
+        # No visibility; assume it's fine.
+        return True
+
+    try:
+        cpu = psutil.cpu_percent(interval=0.3)
+    except Exception:
+        cpu = 0.0
+
+    if cpu >= BUSY_CPU_THRESHOLD:
+        # System is already busy; don't add more work.
+        return False
+
+    # Battery guardrail (mainly laptops)
+    if DISABLE_ON_BATTERY:
+        try:
+            battery = psutil.sensors_battery()
+        except Exception:
+            battery = None
+
+        if battery is not None and not battery.power_plugged:
+            # On battery and policy says "do not run".
+            return False
+
+    return True
 
 
 # ---------------- HTTP helpers ----------------
@@ -299,6 +349,11 @@ def worker_loop() -> None:
     global _running
     print(f"[agent] worker loop starting for {AGENT_NAME}")
     while _running:
+        # Be polite: don't work if the system is busy or on battery (per policy)
+        if not system_allows_work():
+            time.sleep(CPU_CHECK_INTERVAL)
+            continue
+
         # Ask for a task
         task = _get_json("/task", {"agent": AGENT_NAME, "wait_ms": TASK_WAIT_MS})
         if not task:
