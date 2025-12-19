@@ -1,25 +1,24 @@
-# Agent-Lite (Windows) — Headless Service
+# Agent-Lite (Windows) — Headless Service (Admin Only)
 
-Agent-Lite runs as a Windows Service. There is no UI and no user interaction.
-Install and management are intended for administrators only.
+No UI. No prompts. Admin installs and manages the service.
 
-## Requirements
-- Windows 10/11
-- Python 3.8+ (3.11 recommended)
-- Administrator rights
-
-## Configuration
-Agent-Lite reads configuration from:
-
+## Config
+Config file (admin-owned):
 - `%ProgramData%\AgentLite\agent.env`
 
-Installer behavior:
-- If `%ProgramData%\AgentLite\agent.env` does not exist, `install.bat` will copy `agent.env.template` from the install folder.
-- If neither exists, install fails (no prompts).
+Logs:
+- `%ProgramData%\AgentLite\service.log` (service wrapper)
+- `%ProgramData%\AgentLite\agent.log` (agent runtime)
 
 ## Install (Admin)
-Right-click `install.bat` → **Run as administrator**
+Right-click `install.bat` → Run as administrator
 
 ## Verify
-```bat
-sc query AgentLite
+`sc query AgentLite`
+
+## Logs
+`type "%ProgramData%\AgentLite\service.log"`
+`type "%ProgramData%\AgentLite\agent.log"`
+
+## Uninstall (Admin)
+Right-click `uninstall.bat` → Run as administrator
