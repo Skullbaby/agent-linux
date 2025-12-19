@@ -1,103 +1,82 @@
 @echo off
-setlocal ENABLEDELAYEDEXPANSION
+setlocal
 
-REM Agent-Lite USB Installer
-REM Run this as Administrator
+REM Headless Agent-Lite installer (ADMIN ONLY, NO PROMPTS)
 
-echo ========================================
-echo Agent-Lite Installer
-echo ========================================
-echo.
-
-REM Resolve script directory (so relative paths always work)
 set "SCRIPT_DIR=%~dp0"
-set "INSTALL_DIR=%USERPROFILE%\AppData\Local\AgentLite"
-set "ENV_FILE=%SCRIPT_DIR%agent.env"
+set "PROGRAM_DATA=%ProgramData%\AgentLite"
+set "ENV_DST=%PROGRAM_DATA%\agent.env"
+set "ENV_TEMPLATE=%SCRIPT_DIR%agent.env.template"
 
-REM Check for admin rights
+echo ========================================
+echo Agent-Lite Service Installer (Headless)
+echo ========================================
+
+REM Admin check
 net session >nul 2>&1
 if %errorlevel% neq 0 (
-    echo ERROR: This script must be run as Administrator!
-    echo Right-click install.bat and select "Run as administrator"
-    pause
-    exit /b 1
+  echo ERROR: Run this as Administrator.
+  exit /b 1
 )
 
-REM Ensure install dir exists (for logs/config if your service uses it)
-mkdir "%INSTALL_DIR%" >nul 2>&1
+REM Ensure ProgramData folder exists
+mkdir "%PROGRAM_DATA%" >nul 2>&1
 
-echo [1/5] Checking Python installation...
+REM Python check
 python --version >nul 2>&1
 if %errorlevel% neq 0 (
-    echo ERROR: Python is not installed or not in PATH!
-    echo Please install Python 3.8+ from python.org
-    pause
-    exit /b 1
+  echo ERROR: Python is not installed or not in PATH.
+  exit /b 1
 )
-python --version
-echo.
 
-echo [2/5] Installing Python dependencies...
-python -m pip install --upgrade pip
+REM Install deps
+echo Installing dependencies...
+python -m pip install --upgrade pip >nul
 python -m pip install -r "%SCRIPT_DIR%requirements.txt"
+if %errorlevel% neq 0 (
+  echo ERROR: Failed to install requirements.txt
+  exit /b 1
+)
+
 python -m pip install pywin32
 if %errorlevel% neq 0 (
-    echo ERROR: Failed to install dependencies
-    pause
+  echo ERROR: Failed to install pywin32
+  exit /b 1
+)
+
+REM Config: copy template if provided and no config exists
+if not exist "%ENV_DST%" (
+  if exist "%ENV_TEMPLATE%" (
+    copy /Y "%ENV_TEMPLATE%" "%ENV_DST%" >nul
+    echo Config installed: "%ENV_DST%"
+  ) else (
+    echo ERROR: Missing config.
+    echo Provide "%ENV_TEMPLATE%" OR pre-create "%ENV_DST%"
     exit /b 1
-)
-echo.
-
-echo [3/5] Configuring controller URL...
-set /p CONTROLLER_URL="Enter controller URL (e.g., http://192.168.1.100:8080) [default: http://controller:8080]: "
-if "%CONTROLLER_URL%"=="" (
-    set "CONTROLLER_URL=http://controller:8080"
+  )
+) else (
+  echo Config exists: "%ENV_DST%"
 )
 
-REM Write config next to Service.py/app.py so the service can find it reliably
-echo CONTROLLER_URL=%CONTROLLER_URL% > "%ENV_FILE%"
-
-REM Also copy a copy into install dir (useful for troubleshooting / docs consistency)
-copy /Y "%ENV_FILE%" "%INSTALL_DIR%\agent.env" >nul 2>&1
-
-echo Configuration saved:
-echo   %ENV_FILE%
-echo.
-
-echo [4/5] Installing Windows Service...
+REM Install service
 pushd "%SCRIPT_DIR%"
+echo Installing Windows Service...
 python Service.py install
-set "SVC_RC=%errorlevel%"
+if %errorlevel% neq 0 (
+  popd
+  echo ERROR: Service install failed.
+  exit /b 1
+)
+
+REM Recovery + auto start
+sc failure AgentLite reset= 86400 actions= restart/60000/restart/60000/restart/60000 >nul
+sc config AgentLite start= auto >nul
+
+REM Start
+net start AgentLite >nul 2>&1
+
 popd
 
-if %SVC_RC% neq 0 (
-    echo ERROR: Failed to install service
-    pause
-    exit /b 1
-)
-echo.
-
-echo [5/5] Starting Agent-Lite service...
-net start AgentLite
-if %errorlevel% neq 0 (
-    echo WARNING: Service failed to start automatically
-    echo Check logs at: "%INSTALL_DIR%\service.log"
-)
-echo.
-
-echo ========================================
-echo Installation Complete!
-echo ========================================
-echo.
-echo Service Status:
-sc query AgentLite
-echo.
-echo View logs:
-echo   type "%INSTALL_DIR%\service.log"
-echo.
-echo Manage service:
-echo   net stop AgentLite      - Stop the service
-echo   net start AgentLite     - Start the service
-echo   python Service.py remove - Uninstall (run from the Agent-Lite folder)
-echo.
-pause
+echo Done.
+echo Logs: "%PROGRAM_DATA%\service.log"
+exit /b 0
