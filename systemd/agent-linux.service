@@ -1,0 +1,16 @@
+[Unit]
+Description=MYZEL Agent Linux (Lite)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/agent-linux
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/pi/agent-linux/.venv/bin/python /home/pi/agent-linux/app.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
