@@ -1,82 +1,52 @@
-# app.py
-# MYZEL CPU Agent (dynamic workers) — controller-aligned
-#
-# Controller contract:
-#   - Lease task:  GET /api/task?agent=NAME&wait_ms=MS   (also /task)
-#   - Register:    POST /api/agents/register            (also /agents/register)
-#   - Heartbeat:   POST /api/agents/heartbeat           (also /agents/heartbeat)
-#   - Result:      POST /api/result                     (also /result)
-#
-# Dynamic worker design:
-#   - Start with 1 worker loop
-#   - Grow worker count while there are bubbles (tasks available) and CPU headroom exists
-#   - Shrink when idle / CPU is saturated
-#
-# CPU execution:
-#   - ProcessPoolExecutor for CPU-bound ops (bypasses GIL)
-#   - I/O-light ops can still run inline if they’re cheap, but default is via CPU pool
-#
-# Notes:
-#   - This file intentionally does NOT include any “battery power” behavior.
-#   - Designed to run cleanly on Linux + “forever stack” style service/runtime.
+#!/usr/bin/env python3
+from __future__ import annotations
 
 import os
-import sys
 import time
 import json
 import socket
 import signal
 import random
 import threading
-from typing import Any, Dict, Optional
+import traceback
+from typing import Any, Dict, Optional, List, Tuple
 from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeoutError
 
 import requests
 
 try:
-    import psutil
+    import psutil  # type: ignore
 except Exception:
     psutil = None
-
-from ops_loader import load_ops
-from worker_sizing import build_worker_profile
 
 
 # ---------------- config ----------------
 
-CONTROLLER_URL = os.getenv("CONTROLLER_URL", "http://controller:8080").rstrip("/")
-API_PREFIX_RAW = os.getenv("API_PREFIX", "/api").strip()
+CONTROLLER_URL = os.getenv("CONTROLLER_URL", "http://10.11.12.54:8080").rstrip("/")
 AGENT_NAME = os.getenv("AGENT_NAME") or socket.gethostname()
 
+HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "8"))
+LEASE_TIMEOUT_MS = int(os.getenv("LEASE_TIMEOUT_MS", "2500"))
+IDLE_SLEEP_SEC = float(os.getenv("IDLE_SLEEP_SEC", "0.05"))
+
+TASK_EXEC_TIMEOUT_SEC = float(os.getenv("TASK_EXEC_TIMEOUT_SEC", "60"))
+
+# Ops advertised to controller
 TASKS_RAW = os.getenv("TASKS", "echo")
 TASKS = [t.strip() for t in TASKS_RAW.split(",") if t.strip()]
 
-# Leave some cores for OS / background services.
-RESERVED_CORES = int(os.getenv("RESERVED_CORES", "4"))
+# Workers
+CPU_MIN_WORKERS = int(os.getenv("CPU_MIN_WORKERS", "1"))
+CPU_MAX_WORKERS = int(os.getenv("CPU_MAX_WORKERS", "0"))  # 0 => auto
+RESERVED_CORES = int(os.getenv("RESERVED_CORES", "2"))
 
-HEARTBEAT_SEC = float(os.getenv("HEARTBEAT_SEC", "3"))
-WAIT_MS = int(os.getenv("WAIT_MS", "2000"))
-LEASE_IDLE_SEC = float(os.getenv("LEASE_IDLE_SEC", "0.05"))
-
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "6"))
-
-# dynamic tuning
-CPU_MIN_WORKERS = max(1, int(os.getenv("CPU_MIN_WORKERS", "1")))
-CPU_PIPELINE_FACTOR = float(os.getenv("CPU_PIPELINE_FACTOR", "1.25"))  # inflight vs workers
-TARGET_CPU_UTIL_PCT = float(os.getenv("TARGET_CPU_UTIL_PCT", "75"))
-SCALE_TICK_SEC = float(os.getenv("SCALE_TICK_SEC", "2.0"))
-
-# worker execution guardrails
-TASK_EXEC_TIMEOUT_SEC = float(os.getenv("TASK_EXEC_TIMEOUT_SEC", "60"))
-
-# labels
+# Optional labels (json or k=v,k2=v2)
 AGENT_LABELS_RAW = os.getenv("AGENT_LABELS", "")
 AGENT_LABELS: Dict[str, Any] = {}
 if AGENT_LABELS_RAW.strip():
     try:
         AGENT_LABELS = json.loads(AGENT_LABELS_RAW)
     except Exception:
-        # allow simple k=v,k2=v2
         for part in AGENT_LABELS_RAW.split(","):
             part = part.strip()
             if not part or "=" not in part:
@@ -85,289 +55,233 @@ if AGENT_LABELS_RAW.strip():
             AGENT_LABELS[k.strip()] = v.strip()
 
 
-# ---------------- logging ----------------
-
-_LOG_LOCK = threading.Lock()
-_last_log: Dict[str, float] = {}
-
-
-def log(msg: str, key: str = "default", every: float = 1.0) -> None:
-    now = time.time()
-    with _LOG_LOCK:
-        last = _last_log.get(key, 0.0)
-        if now - last >= every:
-            _last_log[key] = now
-            print(msg, flush=True)
-
-
 # ---------------- runtime state ----------------
 
 stop_event = threading.Event()
-OPS = load_ops(TASKS)
+_session = requests.Session()
 
-WORKER_PROFILE = build_worker_profile()
-CPU_PROFILE = WORKER_PROFILE.get("cpu", {})
-USABLE_CORES = int(CPU_PROFILE.get("usable_cores", 1))
-
-# ---------------- CPU execution pool ----------------
-
-# Use processes for true CPU parallelism (bypasses GIL)
-_CPU_WORKERS = max(1, USABLE_CORES)
-_CPU_POOL = ProcessPoolExecutor(max_workers=_CPU_WORKERS)
-
-# Scaling state
-_current_workers_lock = threading.Lock()
-_current_workers = 1
-
-# Inflight tracking (best-effort)
 _hits = 0
 _misses = 0
 _inflight = 0
-_worker_lock = threading.Lock()
+_lock = threading.Lock()
 
-_session = requests.Session()
-
-# Determine API prefix (try /api then fallback)
-API_PREFIX = API_PREFIX_RAW if API_PREFIX_RAW.startswith("/") else f"/{API_PREFIX_RAW}"
+_worker_threads: Dict[int, threading.Thread] = {}
 
 
-def _url(path: str) -> str:
-    if not path.startswith("/"):
-        path = "/" + path
-    return f"{CONTROLLER_URL}{path}"
+# ---------------- ops loading ----------------
+# If you have ops_loader like your other agents, use it. Otherwise fall back to echo-only.
+
+OPS: Dict[str, Any] = {}
+
+def op_echo(payload: Any) -> Any:
+    return {"ok": True, "echo": payload}
+
+try:
+    from ops_loader import load_ops  # type: ignore
+    OPS = load_ops(TASKS)
+except Exception:
+    OPS = {"echo": op_echo}
 
 
-def _api(path: str) -> str:
-    # path should start with /...
-    if not path.startswith("/"):
-        path = "/" + path
-    return _url(f"{API_PREFIX}{path}")
+# ---------------- helpers ----------------
 
+def log(msg: str) -> None:
+    print(msg, flush=True)
 
-def _probe_prefix() -> None:
-    global API_PREFIX
-    # Try /api first, then no prefix
-    candidates = [API_PREFIX, ""]
-    for pref in candidates:
-        try_url = f"{CONTROLLER_URL}{pref}/healthz" if pref else f"{CONTROLLER_URL}/healthz"
-        try:
-            r = _session.get(try_url, timeout=HTTP_TIMEOUT)
-            if r.status_code < 500:
-                API_PREFIX = pref
-                log(f"[agent] API prefix set to: '{API_PREFIX or '(none)'}'", "prefix", every=0.0)
-                return
-        except Exception:
-            continue
-    # If nothing worked, keep current and let registration attempts show the error.
-    log("[agent] WARNING: could not probe API prefix; using configured API_PREFIX.", "prefix_warn", every=0.0)
-
-
-def _post_json(url: str, payload: Dict[str, Any]) -> requests.Response:
-    return _session.post(url, json=payload, timeout=HTTP_TIMEOUT)
-
-
-def _get_json(url: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    r = _session.get(url, params=params, timeout=HTTP_TIMEOUT)
-    if r.status_code == 204:
-        return None
-    r.raise_for_status()
-    return r.json()
-
-
-def register() -> None:
-    payload = {
-        "agent": AGENT_NAME,
-        "tasks": TASKS,
-        "worker_profile": WORKER_PROFILE,
-        "labels": AGENT_LABELS,
-        "ts": time.time(),
-    }
-    # /agents/register (or /api/agents/register)
-    url = _api("/agents/register") if API_PREFIX else _url("/agents/register")
-    r = _post_json(url, payload)
-    r.raise_for_status()
-    log(f"[agent] registered as {AGENT_NAME} tasks={TASKS}", "register", every=0.0)
-
-
-def heartbeat_loop() -> None:
-    url = _api("/agents/heartbeat") if API_PREFIX else _url("/agents/heartbeat")
-    while not stop_event.is_set():
-        try:
-            payload = {"agent": AGENT_NAME, "ts": time.time()}
-            _post_json(url, payload)
-        except Exception as e:
-            log(f"[agent] heartbeat error: {e}", "hb_err", every=3.0)
-        stop_event.wait(HEARTBEAT_SEC)
-
-
-def lease_task() -> Optional[Dict[str, Any]]:
-    # /task?agent=...&wait_ms=...
-    url = _api("/task") if API_PREFIX else _url("/task")
-    params = {"agent": AGENT_NAME, "wait_ms": WAIT_MS}
+def _collect_metrics() -> Dict[str, Any]:
+    if psutil is None:
+        return {}
     try:
-        task = _get_json(url, params)
-        return task
-    except requests.HTTPError as e:
-        log(f"[agent] lease HTTP error: {e}", "lease_http", every=2.0)
+        return {
+            "cpu_util": float(psutil.cpu_percent(interval=None)) / 100.0,
+            "ram_mb": float(psutil.virtual_memory().used) / (1024 * 1024),
+        }
+    except Exception:
+        return {}
+
+def _usable_cores() -> int:
+    if psutil is None:
+        return 1
+    try:
+        n = psutil.cpu_count(logical=True) or 1
+    except Exception:
+        n = 1
+    return max(1, n - max(0, RESERVED_CORES))
+
+def _default_max_workers() -> int:
+    if CPU_MAX_WORKERS and CPU_MAX_WORKERS > 0:
+        return max(CPU_MIN_WORKERS, CPU_MAX_WORKERS)
+    return max(CPU_MIN_WORKERS, _usable_cores())
+
+def _post_json(path: str, payload: Dict[str, Any]) -> Tuple[int, Any]:
+    url = f"{CONTROLLER_URL}{path}"
+    try:
+        r = _session.post(url, json=payload, timeout=HTTP_TIMEOUT_SEC)
     except Exception as e:
-        log(f"[agent] lease error: {e}", "lease_err", every=2.0)
-    return None
+        return 0, {"error": str(e), "url": url}
+
+    if r.status_code == 204:
+        return 204, None
+
+    try:
+        body = r.json()
+    except Exception:
+        body = r.text
+
+    return r.status_code, body
+
+def _extract_task(task: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
+    job_id = task.get("id") or task.get("job_id")
+    op = task.get("op")
+    payload = task.get("payload") or {}
+
+    if not isinstance(job_id, str) or not job_id:
+        raise RuntimeError(f"task missing job id: {task!r}")
+    if not isinstance(op, str) or not op:
+        raise RuntimeError(f"task missing op: {task!r}")
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"task payload not dict: {task!r}")
+
+    return job_id, op, payload
 
 
-def post_result(job_id: str, ok: bool, result: Any = None, error: str = "", meta: Optional[Dict[str, Any]] = None) -> None:
-    url = _api("/result") if API_PREFIX else _url("/result")
+# ---------------- v1 leasing/results ----------------
+
+def lease_once(max_tasks: int) -> Optional[Tuple[str, Dict[str, Any]]]:
     payload: Dict[str, Any] = {
         "agent": AGENT_NAME,
-        "job_id": job_id,
-        "ok": ok,
-        "result": result,
-        "error": error,
-        "ts": time.time(),
+        "capabilities": {"ops": TASKS},
+        "max_tasks": max_tasks,
+        "timeout_ms": LEASE_TIMEOUT_MS,
+        "labels": AGENT_LABELS,
+        "worker_profile": {
+            "tier": "cpu",
+            "cpu": {"usable_cores": _usable_cores(), "min_cpu_workers": CPU_MIN_WORKERS, "max_cpu_workers": _default_max_workers()},
+            "workers": {"max_total_workers": _default_max_workers()},
+        },
+        "metrics": _collect_metrics(),
     }
-    if meta:
-        payload["meta"] = meta
-    try:
-        r = _post_json(url, payload)
-        r.raise_for_status()
-    except Exception as e:
-        log(f"[agent] post_result error job_id={job_id}: {e}", "post_err", every=2.0)
+
+    code, body = _post_json("/v1/leases", payload)
+    if code == 204:
+        return None
+    if code == 0:
+        raise RuntimeError(f"lease failed: {body}")
+    if code >= 400:
+        raise RuntimeError(f"lease HTTP {code}: {body}")
+
+    if not isinstance(body, dict):
+        raise RuntimeError(f"lease body not dict: {body!r}")
+
+    lease_id = body.get("lease_id")
+    tasks = body.get("tasks")
+
+    if not isinstance(lease_id, str) or not lease_id:
+        raise RuntimeError(f"lease missing lease_id: {body!r}")
+    if not isinstance(tasks, list) or not tasks:
+        return None
+
+    task = tasks[0]
+    if not isinstance(task, dict):
+        raise RuntimeError(f"task not dict: {task!r}")
+
+    return lease_id, task
 
 
-def _run_op(op_name: str, payload: Any) -> Any:
-    fn = OPS.get(op_name)
-    if not fn:
-        raise RuntimeError(f"unknown op: {op_name}")
+def post_result(lease_id: str, job_id: str, ok: bool, result: Any = None, error: Any = None) -> None:
+    payload: Dict[str, Any] = {
+        "lease_id": lease_id,
+        "job_id": job_id,
+        "status": "succeeded" if ok else "failed",
+        "result": result if ok else None,
+        "error": None if ok else error,
+    }
+    code, body = _post_json("/v1/results", payload)
+    if code == 0:
+        raise RuntimeError(f"result failed: {body}")
+    if code >= 400:
+        raise RuntimeError(f"result HTTP {code}: {body}")
+
+
+# ---------------- execution ----------------
+
+CPU_POOL = ProcessPoolExecutor(max_workers=_default_max_workers())
+
+def _run_op(op: str, payload: Dict[str, Any]) -> Any:
+    fn = OPS.get(op)
+    if fn is None:
+        raise RuntimeError(f"unknown op: {op}")
     return fn(payload)
 
-
-def execute_task(task: Dict[str, Any]) -> None:
+def execute_one(lease_id: str, task: Dict[str, Any]) -> None:
     global _inflight
-    job_id = str(task.get("job_id") or task.get("id") or "")
-    op = str(task.get("op") or "")
-    payload = task.get("payload")
-
-    if not job_id:
-        log("[agent] malformed task missing job_id", "malformed", every=1.0)
-        return
-    if not op:
-        post_result(job_id, False, result=None, error="malformed task: missing op")
-        return
+    job_id, op, payload = _extract_task(task)
 
     t0 = time.time()
-    with _worker_lock:
+    with _lock:
         _inflight += 1
 
     try:
-        # Default: run in CPU pool (safe for CPU bound).
-        future = _CPU_POOL.submit(_run_op, op, payload)
+        future = CPU_POOL.submit(_run_op, op, payload)
         out = future.result(timeout=TASK_EXEC_TIMEOUT_SEC)
         dt = (time.time() - t0) * 1000.0
-        post_result(job_id, True, result=out, error="", meta={"op": op, "ms": dt})
+        post_result(lease_id, job_id, True, result={"out": out, "ms": dt, "op": op})
     except FuturesTimeoutError:
         dt = (time.time() - t0) * 1000.0
-        post_result(job_id, False, result=None, error=f"timeout after {TASK_EXEC_TIMEOUT_SEC}s", meta={"op": op, "ms": dt})
+        post_result(lease_id, job_id, False, error={"error": "timeout", "ms": dt, "op": op})
     except Exception as e:
         dt = (time.time() - t0) * 1000.0
-        post_result(job_id, False, result=None, error=str(e), meta={"op": op, "ms": dt})
+        post_result(
+            lease_id,
+            job_id,
+            False,
+            error={"type": type(e).__name__, "message": str(e), "ms": dt, "op": op, "trace": traceback.format_exc(limit=10)},
+        )
     finally:
-        with _worker_lock:
+        with _lock:
             _inflight = max(0, _inflight - 1)
 
 
-def worker_loop(worker_id: int) -> None:
+def worker_loop(wid: int) -> None:
     global _hits, _misses
-    log(f"[agent] worker-{worker_id} start", f"wstart{worker_id}", every=0.0)
-
+    log(f"[agent-linux-v1] worker-{wid} start")
     while not stop_event.is_set():
-        task = lease_task()
-        if task:
-            _hits += 1
-            execute_task(task)
+        try:
+            leased = lease_once(max_tasks=1)
+        except Exception as e:
+            log(f"[agent-linux-v1] lease error: {e}")
+            stop_event.wait(1.0)
             continue
 
-        _misses += 1
-        # Idle wait with a touch of jitter to avoid herd behavior.
-        idle = LEASE_IDLE_SEC * (0.5 + random.random())
-        stop_event.wait(idle)
+        if not leased:
+            with _lock:
+                _misses += 1
+            stop_event.wait(IDLE_SLEEP_SEC * (0.5 + random.random()))
+            continue
 
-    log(f"[agent] worker-{worker_id} stop", f"wstop{worker_id}", every=0.0)
+        lease_id, task = leased
+        with _lock:
+            _hits += 1
+        try:
+            execute_one(lease_id, task)
+        except Exception as e:
+            log(f"[agent-linux-v1] execute error: {e}")
 
-
-def _cpu_util() -> float:
-    if psutil is None:
-        return 0.0
-    try:
-        return float(psutil.cpu_percent(interval=None))
-    except Exception:
-        return 0.0
-
-
-def scale_loop() -> None:
-    global _current_workers
-
-    while not stop_event.is_set():
-        cpu = _cpu_util()
-        with _worker_lock:
-            inflight = _inflight
-        # Target inflight workers based on usable cores and pipeline factor
-        desired = max(CPU_MIN_WORKERS, int(max(1, USABLE_CORES) * CPU_PIPELINE_FACTOR))
-        # If CPU is too hot, reduce pressure
-        if cpu >= TARGET_CPU_UTIL_PCT:
-            desired = max(CPU_MIN_WORKERS, min(desired, max(1, USABLE_CORES)))
-
-        # If we're missing a lot, reduce (idle)
-        misses = _misses
-        hits = _hits
-
-        with _current_workers_lock:
-            current = _current_workers
-
-        # Simple heuristics:
-        # - If we’re getting tasks (hits) and CPU has headroom, grow up to desired
-        # - If idle (misses >> hits), shrink
-        grow = hits > 0 and cpu < TARGET_CPU_UTIL_PCT
-        idle = misses > max(25, hits * 5)
-
-        target = current
-        if grow and current < desired:
-            target = min(desired, current + 1)
-        elif idle and current > CPU_MIN_WORKERS:
-            target = max(CPU_MIN_WORKERS, current - 1)
-
-        if target != current:
-            log(f"[agent] scale workers {current} -> {target} (cpu={cpu:.1f} inflight={inflight} hits={hits} misses={misses})",
-                "scale", every=0.0)
-            set_worker_count(target)
-
-        stop_event.wait(SCALE_TICK_SEC)
+    log(f"[agent-linux-v1] worker-{wid} stop")
 
 
-_worker_threads: Dict[int, threading.Thread] = {}
-_worker_stop_flags: Dict[int, threading.Event] = {}
-
-
-def set_worker_count(n: int) -> None:
-    global _current_workers
-
+def set_workers(n: int) -> None:
     n = max(CPU_MIN_WORKERS, int(n))
-
-    with _current_workers_lock:
-        current = _current_workers
-        _current_workers = n
-
-    # Start new workers
-    for wid in range(current + 1, n + 1):
+    for wid in range(1, n + 1):
+        if wid in _worker_threads:
+            continue
         t = threading.Thread(target=worker_loop, args=(wid,), daemon=True)
         _worker_threads[wid] = t
         t.start()
 
-    # Note: We do not hard-kill threads; they exit via stop_event.
-    # Shrinking just means we stop spawning additional workers and let current idle.
-    # (If you want “true” shrink, do per-thread stop flags; for now we keep it simple.)
 
-
-def shutdown(signum: int, frame: Any) -> None:
-    log(f"[agent] shutdown signal {signum}", "shutdown", every=0.0)
+def shutdown(signum: int, _frame: Any) -> None:
+    log(f"[agent-linux-v1] shutdown signal {signum}")
     stop_event.set()
 
 
@@ -375,41 +289,21 @@ def main() -> int:
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    _probe_prefix()
+    if not TASKS:
+        log("[agent-linux-v1] TASKS empty; exiting")
+        return 2
 
-    # Register (retry loop)
-    while not stop_event.is_set():
-        try:
-            register()
-            break
-        except Exception as e:
-            log(f"[agent] register error: {e}", "reg_err", every=2.0)
-            stop_event.wait(2.0)
+    n = _default_max_workers()
+    log(f"[agent-linux-v1] starting name={AGENT_NAME} controller={CONTROLLER_URL} ops={TASKS} workers={n}")
+    set_workers(n)
 
-    if stop_event.is_set():
-        return 1
-
-    # Heartbeat
-    hb = threading.Thread(target=heartbeat_loop, daemon=True)
-    hb.start()
-
-    # Start initial workers
-    set_worker_count(1)
-
-    # Scaling manager
-    scaler = threading.Thread(target=scale_loop, daemon=True)
-    scaler.start()
-
-    # Keep main alive
     while not stop_event.is_set():
         stop_event.wait(0.5)
 
-    # Shutdown pool
     try:
-        _CPU_POOL.shutdown(wait=False, cancel_futures=True)
+        CPU_POOL.shutdown(wait=False, cancel_futures=True)
     except Exception:
         pass
-
     return 0
 
 
